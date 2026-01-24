@@ -23,50 +23,100 @@ else()
   endmacro()
 endif()
 
-# Handle TVM prebuild path or use default configuration
-if(DEFINED TVM_PREBUILD_PATH)
-  message(STATUS "TVM_PREBUILD_PATH: ${TVM_PREBUILD_PATH}")
-
-  if(EXISTS ${TVM_PREBUILD_PATH}/config.cmake)
-    include(${TVM_PREBUILD_PATH}/config.cmake)
-  endif()
-else()
-  if(EXISTS ${CMAKE_BINARY_DIR}/config.cmake)
-    include(${CMAKE_BINARY_DIR}/config.cmake)
-  elseif(EXISTS ${CMAKE_SOURCE_DIR}/config.cmake)
-    include(${CMAKE_SOURCE_DIR}/config.cmake)
-  endif()
-
-  # Set default build type to RelWithDebInfo if not provided
-  if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
-    message(STATUS "Setting default build type to ${CMAKE_BUILD_TYPE}")
-  endif()
+# Set default build type to RelWithDebInfo if not provided
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+  message(STATUS "Setting default build type to ${CMAKE_BUILD_TYPE}")
 endif()
 
 # Setting up MLIR infrastructure
 set(NPUIR_LIBS "")
-if(USE_NPUIR)
-  set(BISHENGIR_INCLUDE_DIRS "")
-  set(BISHENGIR_LIBRARY_DIRS "")
-  if(NOT BISHENGIR_ROOT_PATH)
-    find_package(MLIR REQUIRED CONFIG)
-    message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
-    list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
-    list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
-    set(BISHENGIR_INCLUDE_DIRS ${LLVM_INCLUDE_DIRS})
-    set(BISHENGIR_LIBRARY_DIRS ${LLVM_LIBRARY_DIRS})
-    file(GLOB NPUIR_LIBS "${LLVM_LIBRARY_DIRS}/*.a")
-  else()
-    set(BISHENGIR_INCLUDE_DIRS ${BISHENGIR_ROOT_PATH}/include)
-    set(BISHENGIR_LIBRARY_DIRS ${BISHENGIR_ROOT_PATH}/lib)
-    file(GLOB NPUIR_LIBS "${BISHENGIR_ROOT_PATH}/lib/*.a")
+set(BISHENGIR_INCLUDE_DIRS "")
+set(BISHENGIR_LIBRARY_DIRS "")
+
+# If BISHENGIR_ROOT_PATH is not set, auto-build bishengir in 3rdparty
+if(NOT BISHENGIR_ROOT_PATH)
+    set(BISHENGIR_AUTO_BUILD_DIR "${PROJECT_SOURCE_DIR}/3rdparty/AscendNPU-IR")
+    set(BISHENGIR_AUTO_BUILD_INSTALL "${BISHENGIR_AUTO_BUILD_DIR}/build/install")
+    
+    message(STATUS "BISHENGIR_ROOT_PATH not set, auto-building bishengir in 3rdparty...")
+    
+    # Initialize submodule if needed
+    if(NOT EXISTS "${BISHENGIR_AUTO_BUILD_DIR}/.git")
+      message(STATUS "Initializing AscendNPU-IR submodule...")
+      execute_process(
+        COMMAND git submodule update --init --recursive 3rdparty/AscendNPU-IR
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        RESULT_VARIABLE GIT_SUBMODULE_RESULT
+        OUTPUT_QUIET
+        ERROR_QUIET
+      )
+      if(NOT GIT_SUBMODULE_RESULT EQUAL "0")
+        message(FATAL_ERROR "Failed to initialize AscendNPU-IR submodule.")
+      endif()
+    endif()
+    
+    # Apply patches
+    if(EXISTS "${BISHENGIR_AUTO_BUILD_DIR}/build-tools/apply_patches.sh")
+      execute_process(
+        COMMAND bash ./build-tools/apply_patches.sh
+        WORKING_DIRECTORY ${BISHENGIR_AUTO_BUILD_DIR}
+        RESULT_VARIABLE APPLY_PATCHES_RESULT
+        OUTPUT_ECHO_STDOUT
+        ERROR_ECHO_STDERR
+      )
+      if(NOT APPLY_PATCHES_RESULT EQUAL "0")
+        message(WARNING "Failed to apply patches, continuing anyway...")
+      endif()
+    endif()
+    
+    # Remove old build directory
+    if(EXISTS "${BISHENGIR_AUTO_BUILD_DIR}/build")
+      file(REMOVE_RECURSE "${BISHENGIR_AUTO_BUILD_DIR}/build")
+    endif()
+    
+    # Build bishengir
+    message(STATUS "Building bishengir (this may take a while)...")
+    execute_process(
+      COMMAND bash ./build-tools/build.sh -o ./build 
+        --build-torch-mlir 
+        --c-compiler=clang 
+        --cxx-compiler=clang++ 
+        --add-cmake-options="-DCMAKE_LINKER=lld -DLLVM_ENABLE_LLD=ON" 
+        --apply-patches 
+        --bishengir-publish=off
+      WORKING_DIRECTORY ${BISHENGIR_AUTO_BUILD_DIR}
+      RESULT_VARIABLE BUILD_BISHENGIR_RESULT
+      OUTPUT_VARIABLE BUILD_OUTPUT
+      ERROR_VARIABLE BUILD_ERROR
+      OUTPUT_ECHO_STDOUT
+      ERROR_ECHO_STDERR
+    )
+    
+    if(NOT BUILD_BISHENGIR_RESULT EQUAL "0")
+      message(FATAL_ERROR "Failed to build bishengir. Error: ${BUILD_ERROR}\nOutput: ${BUILD_OUTPUT}\nPlease build bishengir manually or set BISHENGIR_ROOT_PATH.")
+    endif()
+    
+    # Verify build succeeded and set BISHENGIR_ROOT_PATH
+    if(EXISTS "${BISHENGIR_AUTO_BUILD_INSTALL}/include" AND 
+       EXISTS "${BISHENGIR_AUTO_BUILD_INSTALL}/lib")
+      set(BISHENGIR_ROOT_PATH "${BISHENGIR_AUTO_BUILD_INSTALL}")
+      message(STATUS "bishengir built successfully at ${BISHENGIR_ROOT_PATH}")
+    else()
+      message(FATAL_ERROR "bishengir build completed but install directory is missing. Expected: ${BISHENGIR_AUTO_BUILD_INSTALL}")
+    endif()
   endif()
-  message(STATUS "BISHENGIR_INCLUDE_DIRS: ${BISHENGIR_INCLUDE_DIRS}")
-  message(STATUS "BISHENGIR_LIBRARY_DIRS: ${BISHENGIR_LIBRARY_DIRS}")
-  include_directories(${BISHENGIR_INCLUDE_DIRS})
-  link_directories(${BISHENGIR_LIBRARY_DIRS})
-endif()
+  
+# Set up include and library directories
+set(BISHENGIR_INCLUDE_DIRS ${BISHENGIR_ROOT_PATH}/include)
+set(BISHENGIR_LIBRARY_DIRS ${BISHENGIR_ROOT_PATH}/lib)
+file(GLOB NPUIR_LIBS "${BISHENGIR_ROOT_PATH}/lib/*.a")
+
+message(STATUS "BISHENGIR_ROOT_PATH: ${BISHENGIR_ROOT_PATH}")
+message(STATUS "BISHENGIR_INCLUDE_DIRS: ${BISHENGIR_INCLUDE_DIRS}")
+message(STATUS "BISHENGIR_LIBRARY_DIRS: ${BISHENGIR_LIBRARY_DIRS}")
+include_directories(${BISHENGIR_INCLUDE_DIRS})
+link_directories(${BISHENGIR_LIBRARY_DIRS})
 
 # include cmake modules
 include(CheckCXXCompilerFlag)
@@ -125,6 +175,37 @@ if(DEFINED TVM_PREBUILD_PATH)
   )
 else()
   message(STATUS "Building TVM from source at ${TVM_SOURCE_DIR}")
+  
+  # Check if TVM submodule needs to be initialized
+  # Only check if using default 3rdparty/tvm path
+  if(TVM_SOURCE_DIR STREQUAL "${PROJECT_SOURCE_DIR}/3rdparty/tvm")
+    if(NOT EXISTS "${TVM_SOURCE_DIR}/.git" AND NOT EXISTS "${TVM_SOURCE_DIR}/CMakeLists.txt")
+      message(STATUS "TVM submodule not found, initializing...")
+      execute_process(
+        COMMAND git submodule update --init --recursive 3rdparty/tvm
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        RESULT_VARIABLE GIT_SUBMODULE_RESULT
+        OUTPUT_QUIET
+        ERROR_QUIET
+      )
+      if(NOT GIT_SUBMODULE_RESULT EQUAL "0")
+        message(FATAL_ERROR "Failed to initialize TVM submodule. Please run: git submodule update --init --recursive 3rdparty/tvm")
+      endif()
+      message(STATUS "TVM submodule initialized successfully")
+    endif()
+  endif()
+  
+  # Verify TVM source directory exists
+  if(NOT EXISTS "${TVM_SOURCE_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR "TVM source directory not found at ${TVM_SOURCE_DIR}. Please ensure TVM submodule is initialized.")
+  endif()
+  
+  # Configure TVM options via cache variables before adding subdirectory
+  # TVM's CMakeLists.txt will read these variables
+  set(USE_NPUIR ON CACHE BOOL "Enable NPUIR support in TVM" FORCE)
+  if(BISHENGIR_ROOT_PATH)
+    set(BISHENGIR_ROOT_PATH ${BISHENGIR_ROOT_PATH} CACHE PATH "Path to bishengir installation" FORCE)
+  endif()
   add_subdirectory(${TVM_SOURCE_DIR} tvm EXCLUDE_FROM_ALL)
 endif()
 
@@ -151,16 +232,14 @@ if(USE_CUDA)
   list(APPEND TILE_LANG_SRCS ${TILE_LANG_CUDA_SRCS})
 endif()
 
-# Include NPUIR source files if NPUIR is enabled
-if(USE_NPUIR)
-  tilelang_file_glob(GLOB TILE_LANG_NPUIR_SRCS
-    src/target/codegen_npuir.cc
-    src/target/codegen_npuir_api.cc
-    src/target/codegen_npuir_dev.cc
-    src/target/rt_mod_npuir.cc
-  )
-  list(APPEND TILE_LANG_SRCS ${TILE_LANG_NPUIR_SRCS})
-endif()
+# Include NPUIR source files
+tilelang_file_glob(GLOB TILE_LANG_NPUIR_SRCS
+  src/target/codegen_npuir.cc
+  src/target/codegen_npuir_api.cc
+  src/target/codegen_npuir_dev.cc
+  src/target/rt_mod_npuir.cc
+)
+list(APPEND TILE_LANG_SRCS ${TILE_LANG_NPUIR_SRCS})
 
 # Include ROCm source files if ROCm is enabled
 if(USE_ROCM)
