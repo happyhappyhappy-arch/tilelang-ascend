@@ -2629,10 +2629,14 @@ void CodeGenTileLangNPUIRDEV::ReshapeCodegen(const CallNode *op) {
   tvm::tl::NpuirReshape npuirop(op->args, this->vmap);
   Value src = GetVarValue(npuirop.src);
   const auto &dstShape = npuirop.dst_shape;
+
+  // Convert dstShape to int64_t to avoid narrowing issues
+  std::vector<int64_t> dstShape64(dstShape.begin(), dstShape.end());
+
   auto shapeTensorType =
-      mlir::RankedTensorType::get({dstShape.size()}, builder.getIndexType());
+      mlir::RankedTensorType::get({static_cast<int64_t>(dstShape64.size())}, builder.getIndexType());
   auto shapeAttr =
-      mlir::DenseIntElementsAttr::get(shapeTensorType, dstShape);
+      mlir::DenseIntElementsAttr::get(shapeTensorType, dstShape64);
   Value shapeTensor =
       builder.create<mlir::arith::ConstantOp>(builder.getUnknownLoc(), shapeAttr);
 
