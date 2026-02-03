@@ -34,6 +34,7 @@
 #include <tvm/tir/op_attr_types.h>
 #include <tvm/tir/stmt.h>
 #include <tvm/tir/stmt_functor.h>
+#include <tvm/tir/builtin.h>
 #include <utility>
 #include <vector>
 
@@ -1091,6 +1092,39 @@ void CodeGenTileLangNPUIRAPI::VbrcCodegen(const CallNode *op) {
                                       src, dst, broadcastDimAttr);
 }
 
+void CodeGenTileLangNPUIRAPI::FillCodegen(const CallNode *op) {
+  // tl.fill(dst, value): lower to VBrcOp. Reuse VbrcCodegen when dst is tl.region.
+  ICHECK_EQ(op->args.size(), 2U);
+  const PrimExpr& dst_expr = op->args[0];
+  const PrimExpr& value_expr = op->args[1];
+  const CallNode* dst_call = dst_expr.as<CallNode>();
+  if (dst_call && dst_call->op.same_as(Op::Get("tl.region"))) {
+    Call brc_call(DataType::Handle(), Op::Get("tl.npuir_brc"),
+                  Array<PrimExpr>{value_expr, dst_expr});
+    VbrcCodegen(static_cast<const CallNode*>(brc_call.get()));
+    return;
+  }
+  if (dst_call && dst_call->op.same_as(tir::builtin::tvm_access_ptr())) {
+    ICHECK_EQ(dst_call->args.size(), 5U);
+    Var data_var = Downcast<Var>(dst_call->args[1]);
+    ICHECK(this->vmap.count(data_var))
+        << "tl.fill: buffer not found in vmap for tvm_access_ptr data var";
+    Buffer dst_buf = this->vmap[data_var];
+    PrimExpr offset = dst_call->args[2];
+    PrimExpr extent = dst_call->args[3];
+    Array<Range> dst_range = {Range::FromMinExtent(offset, extent)};
+    mlir::Value src = (value_expr.dtype() != dst_buf->dtype)
+                          ? ScalarConvertType(value_expr, dst_buf->dtype)
+                          : MakeValue(value_expr);
+    Value dst = GenSubviewFromRegion(dst_buf, dst_range);
+    auto broadcastDimAttr = builder.getDenseI64ArrayAttr({});
+    builder.create<mlir::hivm::VBrcOp>(builder.getUnknownLoc(), TypeRange{},
+                                        src, dst, broadcastDimAttr);
+    return;
+  }
+  LOG(FATAL) << "tl.fill: unsupported first arg (expected tl.region or tvm_access_ptr)";
+}
+
 void CodeGenTileLangNPUIRAPI::VcastCodegen(const CallNode *op) {
   tvm::tl::NpuirCast npuirop(op->args, this->vmap);
   Value src = GenSubviewFromRegion(npuirop.src, npuirop.src_range);
@@ -1960,6 +1994,8 @@ mlir::Value CodeGenTileLangNPUIRAPI::VisitExpr_(const CallNode *op) {
     CreateHIVMBinaryVectorOp<mlir::hivm::VShROp>(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_brc"))) {
     VbrcCodegen(op);
+  } else if (op->op.same_as(Op::Get("tl.fill"))) {
+    FillCodegen(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_cast"))) {
     VcastCodegen(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_reduce"))) {
@@ -1995,8 +2031,37 @@ mlir::Value CodeGenTileLangNPUIRAPI::VisitExpr_(const CallNode *op) {
   } else if (op->op.same_as(Op::Get("tl.npuir_debug_print_var")) ||
              op->op.same_as(Op::Get("tl.npuir_debug_print_buffer_value"))) {
     DebugPrintCodegen(op);
+  } else if (const OpNode* call_op = op->op.as<OpNode>();
+             call_op && call_op->name == "tir._OpMax") {
+    // T.max(a, b) can appear as Call(tir._OpMax, [a, b]) in TIR. Lower like MaxNode.
+    ICHECK_EQ(op->args.size(), 2U);
+    auto lhs = MakeValue(op->args[0]);
+    auto rhs = MakeValue(op->args[1]);
+    mlir::Value mlirVal;
+    if (op->dtype.is_int()) {
+      mlirVal =
+          BinaryOpCodegen<mlir::arith::MaxSIOp, std::nullptr_t>(op, nullptr, lhs, rhs);
+    } else if (op->dtype.is_uint()) {
+      mlirVal =
+          BinaryOpCodegen<mlir::arith::MaxUIOp, std::nullptr_t>(op, nullptr, lhs, rhs);
+    } else if (op->dtype.is_float()) {
+      mlirVal = BinaryOpCodegen<mlir::arith::MaximumFOp, std::nullptr_t>(op, nullptr, lhs, rhs);
+    } else {
+      LOG(FATAL) << "tir._OpMax: unsupported dtype";
+    }
+    return mlirVal;
   } else {
-    VisitExpr_(op);
+    std::ostringstream os;
+    os << "NPU IR codegen: unhandled CallNode (infinite recursion avoided). ";
+    if (const OpNode* n = op->op.as<OpNode>()) {
+      os << "Op name='" << n->name << "'.";
+    } else if (op->op.defined() && op->op.get()) {
+      os << "Op type=" << op->op.get()->GetTypeKey() << ".";
+    } else {
+      os << "Op is undefined or null.";
+    }
+    os << " Add a handler for this op or ensure the TIR is lowered to supported ops.";
+    LOG(FATAL) << os.str();
   }
   return mlir::Value();
 }
@@ -2084,6 +2149,14 @@ mlir::Value CodeGenTileLangNPUIRAPI::GetAndCastIndexOp(const IterVar iv) {
 
 void CodeGenTileLangNPUIRAPI::VisitStmt_(const AllocateNode *op) {
   ICHECK(!is_zero(op->condition));
+  // Register this allocate's buffer in vmap so tl.fill(tvm_access_ptr(..., buffer_var, ...))
+  // can resolve the buffer. vmap is otherwise only f->buffer_map (parameters); local
+  // allocates are not in buffer_map, so npuir_brc/fill would fail without this.
+  Buffer alloc_buf(op->buffer_var, op->dtype, op->extents, Array<PrimExpr>{},
+                   IntImm(DataType::Int(32), 0), op->buffer_var->name_hint, 0, 0,
+                   BufferType::kDefault);
+  this->vmap.Set(op->buffer_var, alloc_buf);
+
   std::string scope = GetPtrStorageScope(op->buffer_var);
   std::map<std::string, NPU_CORETYPE> scope_coretype_map{
       {"shared", NPU_CORETYPE::AIV},

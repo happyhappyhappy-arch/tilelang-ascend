@@ -171,6 +171,11 @@ def compile_to_kernel_o(func: PrimFunc) -> bytes:
 
     Returns:
         kernel.o 的二进制内容。
+
+    Note:
+        若出现 segmentation fault，崩溃发生在 C++ NPU codegen（target.build.tilelang_npuir_apis）。
+        可用 gdb 获取 backtrace 便于定位：
+            TILELANG_DUMP_IR=0 gdb -ex run -ex "bt full" -ex quit --args python -c "from utils import *; from pipeline import matmul, M,N,K,block_M,block_N,block_K; compile_to_kernel_o(matmul(M,N,K,block_M,block_N,block_K))"
     """
     mod, _ = _symbolic_var_promoter_pass(func)
     out = lower(mod, target="npuir")

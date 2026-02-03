@@ -241,6 +241,7 @@ private:
   void Nz2NdCodegen(const CallNode *op);
   void VexpCodegen(const CallNode *op);
   void VbrcCodegen(const CallNode *op);
+  void FillCodegen(const CallNode *op);
   void VcastCodegen(const CallNode *op);
   void VreduceCodegen(const CallNode *op);
   void VcumsumCodegen(const CallNode *op);

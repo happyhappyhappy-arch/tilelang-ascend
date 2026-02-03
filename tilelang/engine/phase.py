@@ -100,6 +100,8 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         # 2. better to be before PlanAndUpdateBufferAllocationLocation, reuse its ability of Memory reusing
         mod = tilelang.transform.NpuLoopVectorize()(mod)
         mod = tir.transform.PlanAndUpdateBufferAllocationLocation()(mod)
+        mod = tilelang.transform.PipelinePlanning()(mod)
+        mod = tilelang.transform.InjectSoftwarePipeline()(mod)
         mod = tir.transform.LowerOpaqueBlock()(mod)
         mod = tir.transform.RemoveNoOp()(mod)
         return mod
