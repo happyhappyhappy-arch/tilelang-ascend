@@ -1262,18 +1262,18 @@ class compiler_npu:
             Path(ttadapter_path).write_text(linalg)
             bin_file = os.path.join(tmpdir, "kernel")
             bin_path = os.path.join(tmpdir, "kernel.o")
-            
+
             # Hot fix for CANN 8.5
             # Run --adapt-triton-kernel pass before running compilation pipeline
             # TODO: temporary fix, will be updated when bishengir-compile
             # and hivmc gets updated in CANN 8.5
             npu_compiler_opt_path = _get_npucompiler_opt_path()
             ttadapter_opt_path = os.path.join(tmpdir, "kernel-opt.npuir")
-            
+
             _opt_option_list = [
                "--adapt-triton-kernel"
             ]
-            
+
             opt_cmd_list = (
                 [npu_compiler_opt_path, ttadapter_path]
                 + _opt_option_list

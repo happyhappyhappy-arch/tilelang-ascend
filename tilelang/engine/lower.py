@@ -17,6 +17,7 @@ from tilelang.engine.phase import (
     LowerAndLegalize,
     OptimizeForTarget,
 )
+from tilelang import tilelangir
 
 
 def is_cpu_device_backend(target: Target):
@@ -240,16 +241,30 @@ def lower(
     mod = OptimizeForTarget(mod, target)
 
     TILELANG_DUMP_IR = os.environ.get('TILELANG_DUMP_IR', '').lower()
-    if TILELANG_DUMP_IR in ('true', '1', 'yes', 'on'):
+    dump_ir = TILELANG_DUMP_IR in ('true', '1', 'yes', 'on')
+    if dump_ir:
         print("====== TVM IR ======")
         print(mod)
         print()
     if target.kind.name == "npuir":
         codegen_mod = device_codegen(mod, target)
-        if TILELANG_DUMP_IR in ('true', '1', 'yes', 'on'):
+        mlir_str = codegen_mod.get_source()
+        if dump_ir:
             print("====== npuir ======")
-            print(codegen_mod.get_source())
-        return codegen_mod.get_source()
+            print(mlir_str)
+        tilelangir_passes = [
+            ("canonicalize", lambda s: tilelangir.transforms.canonicalize(s, top_down=True)),
+            ("cse", tilelangir.transforms.cse),
+            ("sccp", tilelangir.transforms.sccp),
+            ("cv_split", tilelangir.transforms.cv_split),
+            ("vectorize", tilelangir.transforms.vectorize),
+        ]
+        for pass_name, pass_fn in tilelangir_passes:
+            mlir_str = pass_fn(mlir_str)
+            if dump_ir:
+                print(f"====== after {pass_name} ======")
+                print(mlir_str)
+        return mlir_str
 
     host_mod = tir.transform.Filter(_is_host_call)(mod)
     device_mod = tir.transform.Filter(_is_device_call)(mod)
