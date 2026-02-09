@@ -24,9 +24,12 @@
  */
 #include <tvm/target/target.h>
 #include <tvm/tir/builtin.h>
+#include <tvm/tir/op.h>
+#include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
 #include <unordered_set>
+#include <vector>
 
 #include "support/utils.h"
 #include "tir/schedule/utils.h"
@@ -110,6 +113,71 @@ Stmt replace_if_then_else(Stmt body, PrimExpr condition) {
 }
 
 /*!
+ * \brief Recursively collect AllocateNode buffers from pipeline body and
+ * register them in buffer_data_to_buffer and pipeline_allocs. Used when
+ * for body is not BlockRealize (e.g. NPU SeqStmt with kernel-level allocs).
+ */
+void CollectAllocateBuffers(const Stmt &stmt, Map<Var, Buffer> *buffer_data_to_buffer,
+                            Array<Buffer> &pipeline_allocs) {
+  if (!stmt.defined()) return;
+  if (const auto *alloc = stmt.as<AllocateNode>()) {
+    if (buffer_data_to_buffer->count(alloc->buffer_var) == 0) {
+      Buffer buffer(alloc->buffer_var, alloc->dtype, alloc->extents, Array<PrimExpr>{},
+                    IntImm(DataType::Int(32), 0), alloc->buffer_var->name_hint, 0, 0,
+                    BufferType::kDefault);
+      buffer_data_to_buffer->Set(alloc->buffer_var, buffer);
+      pipeline_allocs.push_back(buffer);
+    }
+    CollectAllocateBuffers(alloc->body, buffer_data_to_buffer, pipeline_allocs);
+    return;
+  }
+  if (const auto *seq = stmt.as<SeqStmtNode>()) {
+    for (const Stmt &s : seq->seq) {
+      CollectAllocateBuffers(s, buffer_data_to_buffer, pipeline_allocs);
+    }
+    return;
+  }
+  if (const auto *realize = stmt.as<BlockRealizeNode>()) {
+    CollectAllocateBuffers(realize->block->body, buffer_data_to_buffer, pipeline_allocs);
+    return;
+  }
+  if (const auto *block = stmt.as<BlockNode>()) {
+    CollectAllocateBuffers(block->body, buffer_data_to_buffer, pipeline_allocs);
+    return;
+  }
+  if (const auto *for_node = stmt.as<ForNode>()) {
+    CollectAllocateBuffers(for_node->body, buffer_data_to_buffer, pipeline_allocs);
+    return;
+  }
+  if (const auto *if_node = stmt.as<IfThenElseNode>()) {
+    CollectAllocateBuffers(if_node->then_case, buffer_data_to_buffer, pipeline_allocs);
+    if (if_node->else_case.defined()) {
+      CollectAllocateBuffers(if_node->else_case.value(), buffer_data_to_buffer, pipeline_allocs);
+    }
+    return;
+  }
+  if (const auto *attr = stmt.as<AttrStmtNode>()) {
+    CollectAllocateBuffers(attr->body, buffer_data_to_buffer, pipeline_allocs);
+    return;
+  }
+}
+
+/*!
+ * \brief Collect all Vars that appear in the given Stmt (e.g. buffer data vars).
+ * Used in NPU path to add buffers used in pipeline body to pipeline_allocs.
+ */
+void CollectVarsInStmt(
+    const Stmt &stmt,
+    std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> *vars) {
+  if (!stmt.defined() || !vars) return;
+  PostOrderVisit(stmt, [vars](const ObjectRef &obj) {
+    if (const auto *v = obj.as<VarNode>()) {
+      vars->insert(GetRef<Var>(v));
+    }
+  });
+}
+
+/*!
  * \brief Rewriter for the body of the software pipeline. This pass inserts
  * `floormod` to indices of the remapped buffer to select the version
  * corresponding to the pipeline stage.
@@ -141,8 +209,6 @@ private:
     if (it != buffer_remap_.end()) {
       Region new_region = buffer_region->region;
       const Buffer &new_buffer = (*it).second;
-      // For pipeline buffers, relax the access region of the first dimension to
-      // full extent if access_all_versions == true
       Range accessed_version =
           access_all_versions_
               ? Range::FromMinExtent(0, new_buffer->shape[0])
@@ -213,8 +279,7 @@ private:
     const Buffer &new_buffer = (*it).second;
     auto *n = store.CopyOnWrite();
     n->buffer = new_buffer;
-    PrimExpr version = floormod(
-        (pipeline_loop_->loop_var - pipeline_loop_->min), new_buffer->shape[0]);
+    PrimExpr version = floormod(pipeline_loop_->loop_var, new_buffer->shape[0]);
     n->indices.insert(n->indices.begin(), version);
     return std::move(store);
   }
@@ -228,8 +293,7 @@ private:
     const Buffer &new_buffer = (*it).second;
     auto *n = load.CopyOnWrite();
     n->buffer = new_buffer;
-    PrimExpr version = floormod(
-        (pipeline_loop_->loop_var - pipeline_loop_->min), new_buffer->shape[0]);
+    PrimExpr version = floormod(pipeline_loop_->loop_var, new_buffer->shape[0]);
     n->indices.insert(n->indices.begin(), version);
     return std::move(load);
   }
@@ -264,15 +328,39 @@ public:
         predicate_condition_(predicate_condition) {}
 
   Stmt BuildPipeline() {
+    // PTO-style: depth from software_pipeline_stage only (max_stage_).
+    // PipelinePlanning assigns stage num_stages-1 for compute, so max_stage_
+    // = num_stages-1 and buffer versions = num_stages.
+
     // Step 1: Analyze accesses to the buffers in the pipeline and compute the
     // number of versions need to maintain for each buffer.
     std::unordered_map<Buffer, BufferAccessInfo, ObjectPtrHash, ObjectPtrEqual>
         infos = GetBufferAccessInfo();
-    for (const Buffer &buffer : pipeline_allocs_) {
-      int num_versions = ComputeBufferVersions(buffer, infos.at(buffer));
+    std::vector<Buffer> all_allocs(pipeline_allocs_.begin(), pipeline_allocs_.end());
+    for (const auto &[buffer, info] : infos) {
+      if (info.def == -1) continue;
+      if (ComputeBufferVersions(buffer, info) < 2) continue;
+      bool found = false;
+      for (const Buffer &a : all_allocs) {
+        if (ObjectPtrEqual()(a, buffer)) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) all_allocs.push_back(buffer);
+    }
+    for (const Buffer &buffer : all_allocs) {
+      auto it = infos.find(buffer);
+      if (it == infos.end()) continue;
+      int num_versions = ComputeBufferVersions(buffer, it->second);
       if (num_versions > 1) {
         buffer_remap_.Set(buffer, RewriteAllocBuffer(buffer, num_versions));
       }
+    }
+    for (const Buffer &buffer : pipeline_allocs_) {
+      if (buffer_remap_.count(buffer)) continue;
+      int num_versions = std::max(2, max_stage_ + 1);
+      buffer_remap_.Set(buffer, RewriteAllocBuffer(buffer, num_versions));
     }
 
     ordered_stmts_.resize(pipeline_info_.size());
@@ -322,7 +410,7 @@ public:
       }
     }
 
-    // Step 2: Emit the pipeline prologue, body and epilogue.
+    // Step 2: Emit prologue, body, epilogue (PTO-style segment bounds).
     Stmt prologue = EmitImpl(pipeline_loop_->min,
                              pipeline_loop_->min + max_stage_, true, true);
     Stmt body =
@@ -337,7 +425,7 @@ public:
     // Step 3: Make a new block that contains new buffer allocations after
     // pipeline rewriting.
     Array<Buffer> alloc_buffers;
-    for (const auto &alloc : pipeline_allocs_) {
+    for (const auto &alloc : all_allocs) {
       alloc_buffers.push_back(buffer_remap_.Get(alloc).value_or(alloc));
       buffer_data_to_buffer_.erase(alloc->data);
     }
@@ -667,15 +755,22 @@ private:
     std::map<int, AsyncStateLocal> async_states_local;
     PrimExpr normalized_access_index;
 
+    PrimExpr delta = start - pipeline_loop_->min;
+    bool is_epilogue_segment =
+        analyzer_.CanProveEqual(start, pipeline_loop_->min + pipeline_loop_->extent);
+
     for (const Block &block : ordered_stmts_) {
       int stage = pipeline_info_.at(block).stage;
       int order = pipeline_info_.at(block).order;
-      PrimExpr inbound = Bool(true);
       PrimExpr skewed_loop_var = new_loop_var - stage;
+      PrimExpr inbound = Bool(true);
       if (need_bound_check)
         inbound =
             analyzer_.Simplify(pipeline_loop_->min <= skewed_loop_var) &&
             (skewed_loop_var < pipeline_loop_->min + pipeline_loop_->extent);
+      if (is_epilogue_segment && pipeline_info_[block].async) {
+        inbound = Bool(false);
+      }
       if (analyzer_.CanProve(!inbound)) {
         continue;
       }
@@ -683,17 +778,9 @@ private:
           PipelineBodyRewriter(buffer_data_to_buffer_, buffer_remap_,
                                pipeline_loop_, max_stage_ != 1)(block));
 
-      PrimExpr delta = start - pipeline_loop_->min;
-      // This variable corresponds to
-      // - "producer_head" if this stage is an async producer
-      // - "consumer_head" if this stage reads from asynchronously written
-      // buffers.
       normalized_access_index =
           is_unit_loop ? skewed_loop_var : skewed_loop_var + delta;
 
-      // Adjust the block predicate and the body according to the final loop
-      // bound
-      //  [pipeline_loop_->min, extent).
       if (!is_unit_loop) {
         Var loop_iter = Downcast<Var>(new_loop_var);
         inbound = Substitute(inbound, {{loop_iter, loop_iter + delta}});
@@ -746,7 +833,7 @@ private:
           preserved_annotations.Set(key, kv.second);
         }
       }
-      new_loop = For(Downcast<Var>(new_loop_var), pipeline_loop_->min, extent,
+      new_loop = For(Downcast<Var>(new_loop_var), start, extent,
                      unroll_loop ? ForKind::kUnrolled : pipeline_loop_->kind,
                      std::move(new_loop), NullOpt, preserved_annotations);
     }
@@ -809,8 +896,17 @@ void BuildDependencyGraph(const Array<Block> &blocks,
 class PipelineInjector : private StmtExprMutator {
 public:
   static Stmt Inject(const PrimFunc &func) {
+    return InjectImpl(func, false);
+  }
+
+  static Stmt InjectNpu(const PrimFunc &func) {
+    return InjectImpl(func, true);
+  }
+
+private:
+  static Stmt InjectImpl(const PrimFunc &func, bool always_collect_alloc_buffers) {
     auto global_symbol = func->GetAttr<String>(tvm::attr::kGlobalSymbol);
-    PipelineInjector injector(global_symbol);
+    PipelineInjector injector(global_symbol, always_collect_alloc_buffers);
     for (const auto &kv : func->buffer_map) {
       const Buffer &buffer = kv.second;
       injector.buffer_data_to_buffer_.Set(buffer->data, buffer);
@@ -818,9 +914,10 @@ public:
     return injector(func->body);
   }
 
-private:
-  explicit PipelineInjector(Optional<String> global_symbol)
-      : global_symbol_(global_symbol) {}
+  explicit PipelineInjector(Optional<String> global_symbol,
+                             bool always_collect_alloc_buffers = false)
+      : global_symbol_(global_symbol),
+        always_collect_alloc_buffers_(always_collect_alloc_buffers) {}
 
   /*!
    * \brief Check the pipeline satisfies the following conditions:
@@ -905,6 +1002,34 @@ private:
     CHECK(pipeline_body_seq) << "ValueError: The body of the software pipeline "
                                 "should be SeqStmt, got "
                              << pipeline_body->GetTypeKey();
+
+    // When body is not BlockRealize (e.g. GPU SeqStmt), or when NPU mode is
+    // enabled (always_collect_alloc_buffers_), collect AllocateNode buffers so
+    // they are in pipeline_allocs and buffer_data_to_buffer_ for
+    // MakeBlock/GetBufferAccessInfo and multi-versioning. NPU may have
+    // BlockRealize but alloc_buffers only on block; body can still contain
+    // AllocateNode for shared buffers that must be multi-versioned.
+    if (!for_node->body.as<BlockRealizeNode>() || always_collect_alloc_buffers_) {
+      CollectAllocateBuffers(pipeline_body, &buffer_data_to_buffer_, pipeline_allocs);
+    }
+    if (always_collect_alloc_buffers_) {
+      std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> vars_in_body;
+      CollectVarsInStmt(pipeline_body, &vars_in_body);
+      for (const auto &kv : buffer_data_to_buffer_) {
+        if (vars_in_body.count(kv.first) == 0) continue;
+        const Buffer &b = kv.second;
+        bool found = false;
+        for (const Buffer &a : pipeline_allocs) {
+          if (ObjectPtrEqual()(a, b)) {
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          pipeline_allocs.push_back(b);
+        }
+      }
+    }
 
     // Step 3: Blockize the components of the pipeline. Each child of the
     // pipelined loop will be converted into a block.
@@ -1021,6 +1146,7 @@ private:
 
   Map<Var, Buffer> buffer_data_to_buffer_;
   Optional<String> global_symbol_;
+  bool always_collect_alloc_buffers_ = false;
 };
 
 /*!
@@ -1038,8 +1164,22 @@ tir::transform::Pass InjectSoftwarePipeline() {
   return CreatePrimFuncPass(pass_func, 0, "tl.InjectSoftwarePipeline", {});
 }
 
+tir::transform::Pass InjectNpuSoftwarePipeline() {
+  using namespace tir::transform;
+  auto pass_func = [=](PrimFunc f, IRModule m, PassContext ctx) {
+    auto *fptr = f.CopyOnWrite();
+    fptr->body = PipelineInjector::InjectNpu(f);
+    fptr->body = ConvertSSA(std::move(fptr->body));
+    return f;
+  };
+  return CreatePrimFuncPass(pass_func, 0, "tl.InjectNpuSoftwarePipeline", {});
+}
+
 TVM_REGISTER_GLOBAL("tl.transform.InjectSoftwarePipeline")
     .set_body_typed(InjectSoftwarePipeline);
+
+TVM_REGISTER_GLOBAL("tl.transform.InjectNpuSoftwarePipeline")
+    .set_body_typed(InjectNpuSoftwarePipeline);
 
 } // namespace tl
 } // namespace tvm

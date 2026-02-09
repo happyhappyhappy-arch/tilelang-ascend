@@ -23,11 +23,14 @@
  */
 
 #include <tvm/arith/analyzer.h>
+#include <tvm/ir/op.h>
 #include <tvm/tir/analysis.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include "../op/ascend.h"
+#include "../op/op.h"
 #include "../target/utils.h"
 
 namespace tvm {
@@ -70,7 +73,9 @@ public:
 
   Array<BufferRegion> GetWrites() const { return writes_; }
 
-  bool GetGlobalCopyPattern() const { return is_global_copy_pattern_; }
+  bool GetGlobalCopyPattern() const {
+    return is_global_copy_pattern_ || is_ascend_copy_;
+  }
 
   PrimExpr GetConditonalExpr() const { return conditonal_expr; }
 
@@ -139,6 +144,23 @@ private:
       conditonal_expr = cond;
       this->VisitExpr(then_expr);
       this->VisitExpr(else_expr);
+    } else if (op->op.same_as(AscendCopy::Get())) {
+      // NPU pipeline: copy is expressed as tl.ascend_copy, not BufferStore.
+      is_ascend_copy_ = true;
+      // Fill reads_/writes_ so use-def sets last_use_stage and copy is assigned stage 0 (prologue).
+      if (args.size() >= 2) {
+        const CallNode *src_call = args[0].as<CallNode>();
+        const CallNode *dst_call = args[1].as<CallNode>();
+        if (src_call && dst_call) {
+          RegionOp src_region(src_call->args, buffer_data_to_buffer_);
+          RegionOp dst_region(dst_call->args, buffer_data_to_buffer_);
+          reads_.push_back(
+              BufferRegion(src_region.GetBuffer(), src_region.GetRanges()));
+          writes_.push_back(
+              BufferRegion(dst_region.GetBuffer(), dst_region.GetRanges()));
+        }
+      }
+      StmtExprVisitor::VisitExpr_(op);
     } else {
       StmtExprVisitor::VisitExpr_(op);
     }
@@ -160,6 +182,7 @@ private:
   bool is_global_read_ = false;
   bool under_buffer_store_ = false;
   bool is_global_copy_pattern_ = false;
+  bool is_ascend_copy_ = false;
   PrimExpr conditonal_expr;
 };
 
@@ -375,7 +398,7 @@ private:
       // - Increment order index
       // - Assign to new stage (current num_stages)
       pinfo.order = order_idx++;
-      pinfo.stage = num_stages;
+      pinfo.stage = num_stages - 1;
 
       for (auto &pinfo_1 : pipeline_stage_infos) {
         if ((pinfo_1.copy_stage &&
@@ -414,8 +437,8 @@ private:
         << "Got " << order_idx << " stages and " << pipeline_stage_infos.size()
         << " pipeline stages.";
 
-    // if all the copy is at the end of the order, we can move these copy to the
-    // beginning of the order and shrink the stage offset by 1.
+    // If all copy is at the end of the order, rotate order so copy runs first.
+    // Do not change stage (no stage--): keep max_stage_ = num_stages-1 for inject.
     int copy_stage_at_end = [&]() {
       int copy_stage_cnt = 0;
       int copy_order_min = pipeline_stage_infos.size();
@@ -433,15 +456,14 @@ private:
       return -1;
     }();
     if (copy_stage_at_end > 0 && num_stages >= 2) {
-      for (auto &pinfo : pipeline_stage_infos) { // move copy to the beginning
+      for (auto &pinfo : pipeline_stage_infos) {
         pinfo.order =
             (pinfo.order + copy_stage_at_end) % pipeline_stage_infos.size();
-        if (!pinfo.copy_stage && !pinfo.prepare_for_condition)
-          pinfo.stage--;
       }
     }
 
-    // Finally, make the pipeline annotation
+    // Finally, make the pipeline annotation. Do not pass num_stages to output
+    // For; InjectPipeline uses PTO-style and derives depth from software_pipeline_stage only.
     Map<String, ObjectRef> annotations;
     for (const auto &[key, value] : loop->annotations) {
       if (key != "num_stages") {

@@ -82,6 +82,8 @@ bool TargetHasAsyncCopy(Target target) {
     } else {
       return false;
     }
+  } else if (target->kind->name == "npuir") {
+    return true;
   }
 
   return false;

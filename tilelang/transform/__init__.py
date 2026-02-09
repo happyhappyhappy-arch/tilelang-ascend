@@ -70,6 +70,20 @@ def InjectSoftwarePipeline():
     return _ffi_api.InjectSoftwarePipeline()  # type: ignore
 
 
+def InjectNpuSoftwarePipeline():
+    """InjectNpuSoftwarePipeline
+
+    NPU variant that always collects AllocateNode buffers from pipeline body
+    (including when body is BlockRealize) so shared buffers get multi-versioning.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.InjectNpuSoftwarePipeline()  # type: ignore
+
+
 def FrontendLegalize():
     """FrontendLegalize
 
