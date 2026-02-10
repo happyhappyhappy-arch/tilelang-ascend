@@ -24,13 +24,14 @@
  */
 #include <tvm/target/target.h>
 #include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include <functional>
 #include <unordered_set>
 #include <vector>
 
+#include "transform/inject_pipeline.h"
 #include "support/utils.h"
 #include "tir/schedule/utils.h"
 #include "tir/transforms/ir_utils.h"
@@ -68,21 +69,6 @@ Block MakeBlock(const Stmt &body,
   return block;
 }
 
-/*! Structure that represents the provided annotation per block or loop. */
-struct PipelineAnnotation {
-  int stage;
-  int order;
-  bool async;
-};
-
-using PipelineInfo = std::unordered_map<Block, PipelineAnnotation,
-                                        ObjectPtrHash, ObjectPtrEqual>;
-
-struct BufferAccessInfo {
-  int def = -1; // the defining stage of the buffer
-  int use = -1; // the last using stage of the buffer
-};
-
 /*!
  * \brief Replace IfThenElse nodes with their then_case, preserving attribute
  * nodes \param body The statement to process \param condition The condition to
@@ -110,71 +96,6 @@ Stmt replace_if_then_else(Stmt body, PrimExpr condition) {
   }
   // For any other node type, return it unchanged
   return body;
-}
-
-/*!
- * \brief Recursively collect AllocateNode buffers from pipeline body and
- * register them in buffer_data_to_buffer and pipeline_allocs. Used when
- * for body is not BlockRealize (e.g. NPU SeqStmt with kernel-level allocs).
- */
-void CollectAllocateBuffers(const Stmt &stmt, Map<Var, Buffer> *buffer_data_to_buffer,
-                            Array<Buffer> &pipeline_allocs) {
-  if (!stmt.defined()) return;
-  if (const auto *alloc = stmt.as<AllocateNode>()) {
-    if (buffer_data_to_buffer->count(alloc->buffer_var) == 0) {
-      Buffer buffer(alloc->buffer_var, alloc->dtype, alloc->extents, Array<PrimExpr>{},
-                    IntImm(DataType::Int(32), 0), alloc->buffer_var->name_hint, 0, 0,
-                    BufferType::kDefault);
-      buffer_data_to_buffer->Set(alloc->buffer_var, buffer);
-      pipeline_allocs.push_back(buffer);
-    }
-    CollectAllocateBuffers(alloc->body, buffer_data_to_buffer, pipeline_allocs);
-    return;
-  }
-  if (const auto *seq = stmt.as<SeqStmtNode>()) {
-    for (const Stmt &s : seq->seq) {
-      CollectAllocateBuffers(s, buffer_data_to_buffer, pipeline_allocs);
-    }
-    return;
-  }
-  if (const auto *realize = stmt.as<BlockRealizeNode>()) {
-    CollectAllocateBuffers(realize->block->body, buffer_data_to_buffer, pipeline_allocs);
-    return;
-  }
-  if (const auto *block = stmt.as<BlockNode>()) {
-    CollectAllocateBuffers(block->body, buffer_data_to_buffer, pipeline_allocs);
-    return;
-  }
-  if (const auto *for_node = stmt.as<ForNode>()) {
-    CollectAllocateBuffers(for_node->body, buffer_data_to_buffer, pipeline_allocs);
-    return;
-  }
-  if (const auto *if_node = stmt.as<IfThenElseNode>()) {
-    CollectAllocateBuffers(if_node->then_case, buffer_data_to_buffer, pipeline_allocs);
-    if (if_node->else_case.defined()) {
-      CollectAllocateBuffers(if_node->else_case.value(), buffer_data_to_buffer, pipeline_allocs);
-    }
-    return;
-  }
-  if (const auto *attr = stmt.as<AttrStmtNode>()) {
-    CollectAllocateBuffers(attr->body, buffer_data_to_buffer, pipeline_allocs);
-    return;
-  }
-}
-
-/*!
- * \brief Collect all Vars that appear in the given Stmt (e.g. buffer data vars).
- * Used in NPU path to add buffers used in pipeline body to pipeline_allocs.
- */
-void CollectVarsInStmt(
-    const Stmt &stmt,
-    std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> *vars) {
-  if (!stmt.defined() || !vars) return;
-  PostOrderVisit(stmt, [vars](const ObjectRef &obj) {
-    if (const auto *v = obj.as<VarNode>()) {
-      vars->insert(GetRef<Var>(v));
-    }
-  });
 }
 
 /*!
@@ -321,35 +242,30 @@ public:
   PipelineRewriter(Map<Var, Buffer> buffer_data_to_buffer,
                    const Array<Buffer> &pipeline_allocs,
                    const For &pipeline_loop, const PipelineInfo &pipeline_info,
-                   PrimExpr predicate_condition = PrimExpr())
+                   PrimExpr predicate_condition = PrimExpr(),
+                   Optional<Array<Buffer>> override_allocs = NullOpt,
+                   std::optional<PipelineSegmentOptions> segment_options =
+                       std::nullopt)
       : buffer_data_to_buffer_(std::move(buffer_data_to_buffer)),
         pipeline_allocs_(pipeline_allocs), pipeline_loop_(pipeline_loop),
         pipeline_info_(pipeline_info),
-        predicate_condition_(predicate_condition) {}
+        predicate_condition_(predicate_condition),
+        override_allocs_(override_allocs),
+        segment_options_(segment_options) {}
 
   Stmt BuildPipeline() {
     // PTO-style: depth from software_pipeline_stage only (max_stage_).
     // PipelinePlanning assigns stage num_stages-1 for compute, so max_stage_
     // = num_stages-1 and buffer versions = num_stages.
 
-    // Step 1: Analyze accesses to the buffers in the pipeline and compute the
-    // number of versions need to maintain for each buffer.
+    // Step 1: Analyze accesses and compute buffer versions. When override_allocs_
+    // is set (NPU path), use it as the alloc list; otherwise use pipeline_allocs_.
     std::unordered_map<Buffer, BufferAccessInfo, ObjectPtrHash, ObjectPtrEqual>
         infos = GetBufferAccessInfo();
-    std::vector<Buffer> all_allocs(pipeline_allocs_.begin(), pipeline_allocs_.end());
-    for (const auto &[buffer, info] : infos) {
-      if (info.def == -1) continue;
-      if (ComputeBufferVersions(buffer, info) < 2) continue;
-      bool found = false;
-      for (const Buffer &a : all_allocs) {
-        if (ObjectPtrEqual()(a, buffer)) {
-          found = true;
-          break;
-        }
-      }
-      if (!found) all_allocs.push_back(buffer);
-    }
-    for (const Buffer &buffer : all_allocs) {
+    Array<Buffer> allocs =
+        override_allocs_.defined() ? override_allocs_.value() : Array<Buffer>(pipeline_allocs_);
+
+    for (const Buffer &buffer : allocs) {
       auto it = infos.find(buffer);
       if (it == infos.end()) continue;
       int num_versions = ComputeBufferVersions(buffer, it->second);
@@ -410,22 +326,34 @@ public:
       }
     }
 
-    // Step 2: Emit prologue, body, epilogue (PTO-style segment bounds).
+    // Step 2: Emit prologue, body, epilogue.
+    // NPU path (segment_options) uses epilogue unroll(0, max_stage_) and body delta=0.
     Stmt prologue = EmitImpl(pipeline_loop_->min,
                              pipeline_loop_->min + max_stage_, true, true);
     Stmt body =
         EmitImpl(pipeline_loop_->min + max_stage_,
                  pipeline_loop_->min + pipeline_loop_->extent, false, false);
-    Stmt epilogue = EmitImpl(
-        pipeline_loop_->min + pipeline_loop_->extent,
-        pipeline_loop_->min + pipeline_loop_->extent + max_stage_, true, true);
+    Stmt epilogue;
+    if (segment_options_.has_value() &&
+        segment_options_.value().epilogue_unroll_from_zero) {
+      PrimExpr epilogue_logical_start =
+          pipeline_loop_->min + pipeline_loop_->extent;
+      epilogue = EmitImpl(
+          make_const(pipeline_loop_->loop_var.dtype(), 0),
+          make_const(pipeline_loop_->loop_var.dtype(), max_stage_),
+          true, true, epilogue_logical_start);
+    } else {
+      epilogue = EmitImpl(
+          pipeline_loop_->min + pipeline_loop_->extent,
+          pipeline_loop_->min + pipeline_loop_->extent + max_stage_, true, true);
+    }
 
     SeqStmt stmt = SeqStmt({prologue, body, epilogue});
 
     // Step 3: Make a new block that contains new buffer allocations after
     // pipeline rewriting.
     Array<Buffer> alloc_buffers;
-    for (const auto &alloc : all_allocs) {
+    for (const auto &alloc : allocs) {
       alloc_buffers.push_back(buffer_remap_.Get(alloc).value_or(alloc));
       buffer_data_to_buffer_.erase(alloc->data);
     }
@@ -731,10 +659,14 @@ private:
    * \param start The start of the range
    * \param end The end of the range
    * \param unroll_loop Whether the loop should be unrolled.
+   * \param epilogue_logical_start When set, emit epilogue with loop 0..extent
+   *        and use this as the logical index base (so body sees indices
+   *        epilogue_logical_start + loop_var - stage).
    * \return The result loop.
    */
   Stmt EmitImpl(PrimExpr start, PrimExpr end, bool unroll_loop,
-                bool need_bound_check) {
+                bool need_bound_check,
+                Optional<PrimExpr> epilogue_logical_start = NullOpt) {
     PrimExpr new_loop_var;
     PrimExpr extent = end - start;
     auto make_nop = []() {
@@ -755,19 +687,39 @@ private:
     std::map<int, AsyncStateLocal> async_states_local;
     PrimExpr normalized_access_index;
 
-    PrimExpr delta = start - pipeline_loop_->min;
-    bool is_epilogue_segment =
-        analyzer_.CanProveEqual(start, pipeline_loop_->min + pipeline_loop_->extent);
+    bool is_epilogue_segment = epilogue_logical_start.defined();
+    PrimExpr delta;
+    if (epilogue_logical_start.defined()) {
+      delta = epilogue_logical_start.value();
+    } else if (segment_options_.has_value() &&
+               segment_options_.value().body_delta_zero &&
+               analyzer_.CanProveEqual(start, pipeline_loop_->min + max_stage_)) {
+      // Body with body_delta_zero: logical index = loop_var - stage.
+      delta = make_const(pipeline_loop_->loop_var.dtype(), 0);
+    } else {
+      delta = start - pipeline_loop_->min;
+    }
+    if (!is_epilogue_segment) {
+      is_epilogue_segment =
+          analyzer_.CanProveEqual(start, pipeline_loop_->min + pipeline_loop_->extent);
+    }
 
     for (const Block &block : ordered_stmts_) {
       int stage = pipeline_info_.at(block).stage;
       int order = pipeline_info_.at(block).order;
       PrimExpr skewed_loop_var = new_loop_var - stage;
       PrimExpr inbound = Bool(true);
-      if (need_bound_check)
-        inbound =
-            analyzer_.Simplify(pipeline_loop_->min <= skewed_loop_var) &&
-            (skewed_loop_var < pipeline_loop_->min + pipeline_loop_->extent);
+      if (need_bound_check) {
+        if (epilogue_logical_start.defined()) {
+          // Epilogue loop is 0..extent; all non-async blocks run at each
+          // drain iteration (logical index = epilogue_logical_start + loop_var - stage).
+          inbound = Bool(true);
+        } else {
+          inbound =
+              analyzer_.Simplify(pipeline_loop_->min <= skewed_loop_var) &&
+              (skewed_loop_var < pipeline_loop_->min + pipeline_loop_->extent);
+        }
+      }
       if (is_epilogue_segment && pipeline_info_[block].async) {
         inbound = Bool(false);
       }
@@ -781,7 +733,7 @@ private:
       normalized_access_index =
           is_unit_loop ? skewed_loop_var : skewed_loop_var + delta;
 
-      if (!is_unit_loop) {
+      if (!is_unit_loop && !epilogue_logical_start.defined()) {
         Var loop_iter = Downcast<Var>(new_loop_var);
         inbound = Substitute(inbound, {{loop_iter, loop_iter + delta}});
       }
@@ -856,6 +808,8 @@ private:
   Map<Buffer, Buffer> buffer_remap_;
   Array<Block> ordered_stmts_;
   std::map<int, AsyncStateGlobal> async_states;
+  Optional<Array<Buffer>> override_allocs_;
+  std::optional<PipelineSegmentOptions> segment_options_;
 };
 
 /*!
@@ -893,20 +847,23 @@ void BuildDependencyGraph(const Array<Block> &blocks,
   }
 }
 
+using PreparePipelineAllocsFn =
+    std::function<void(const Stmt &, Map<Var, Buffer> *, Array<Buffer> &)>;
+
 class PipelineInjector : private StmtExprMutator {
 public:
   static Stmt Inject(const PrimFunc &func) {
-    return InjectImpl(func, false);
+    return InjectImpl(func, nullptr);
   }
 
   static Stmt InjectNpu(const PrimFunc &func) {
-    return InjectImpl(func, true);
+    return InjectImpl(func, &PreparePipelineAllocsNpu);
   }
 
 private:
-  static Stmt InjectImpl(const PrimFunc &func, bool always_collect_alloc_buffers) {
+  static Stmt InjectImpl(const PrimFunc &func, PreparePipelineAllocsFn prepare_allocs) {
     auto global_symbol = func->GetAttr<String>(tvm::attr::kGlobalSymbol);
-    PipelineInjector injector(global_symbol, always_collect_alloc_buffers);
+    PipelineInjector injector(global_symbol, prepare_allocs);
     for (const auto &kv : func->buffer_map) {
       const Buffer &buffer = kv.second;
       injector.buffer_data_to_buffer_.Set(buffer->data, buffer);
@@ -915,9 +872,8 @@ private:
   }
 
   explicit PipelineInjector(Optional<String> global_symbol,
-                             bool always_collect_alloc_buffers = false)
-      : global_symbol_(global_symbol),
-        always_collect_alloc_buffers_(always_collect_alloc_buffers) {}
+                            PreparePipelineAllocsFn prepare_allocs = nullptr)
+      : global_symbol_(global_symbol), prepare_allocs_(prepare_allocs) {}
 
   /*!
    * \brief Check the pipeline satisfies the following conditions:
@@ -1003,32 +959,8 @@ private:
                                 "should be SeqStmt, got "
                              << pipeline_body->GetTypeKey();
 
-    // When body is not BlockRealize (e.g. GPU SeqStmt), or when NPU mode is
-    // enabled (always_collect_alloc_buffers_), collect AllocateNode buffers so
-    // they are in pipeline_allocs and buffer_data_to_buffer_ for
-    // MakeBlock/GetBufferAccessInfo and multi-versioning. NPU may have
-    // BlockRealize but alloc_buffers only on block; body can still contain
-    // AllocateNode for shared buffers that must be multi-versioned.
-    if (!for_node->body.as<BlockRealizeNode>() || always_collect_alloc_buffers_) {
-      CollectAllocateBuffers(pipeline_body, &buffer_data_to_buffer_, pipeline_allocs);
-    }
-    if (always_collect_alloc_buffers_) {
-      std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> vars_in_body;
-      CollectVarsInStmt(pipeline_body, &vars_in_body);
-      for (const auto &kv : buffer_data_to_buffer_) {
-        if (vars_in_body.count(kv.first) == 0) continue;
-        const Buffer &b = kv.second;
-        bool found = false;
-        for (const Buffer &a : pipeline_allocs) {
-          if (ObjectPtrEqual()(a, b)) {
-            found = true;
-            break;
-          }
-        }
-        if (!found) {
-          pipeline_allocs.push_back(b);
-        }
-      }
+    if (prepare_allocs_) {
+      prepare_allocs_(pipeline_body, &buffer_data_to_buffer_, pipeline_allocs);
     }
 
     // Step 3: Blockize the components of the pipeline. Each child of the
@@ -1098,9 +1030,16 @@ private:
     ValidatePipelineBody(pipeline_info, original_order);
 
     // Step 4: Rewrite the pipeline body.
+    Optional<Array<Buffer>> override_allocs = NullOpt;
+    std::optional<PipelineSegmentOptions> segment_options = std::nullopt;
+    if (prepare_allocs_) {
+      override_allocs = MergePipelineAllocsForNpu(pipeline_info, pipeline_allocs);
+      segment_options = GetNpuPipelineSegmentOptions();
+    }
     Stmt pipeline =
         PipelineRewriter(buffer_data_to_buffer_, pipeline_allocs,
-                         GetRef<For>(op), pipeline_info, predicate_condition)
+                         GetRef<For>(op), pipeline_info, predicate_condition,
+                         override_allocs, segment_options)
             .BuildPipeline();
 
     if (const auto *realize = op->body.as<BlockRealizeNode>()) {
@@ -1146,7 +1085,7 @@ private:
 
   Map<Var, Buffer> buffer_data_to_buffer_;
   Optional<String> global_symbol_;
-  bool always_collect_alloc_buffers_ = false;
+  PreparePipelineAllocsFn prepare_allocs_;
 };
 
 /*!

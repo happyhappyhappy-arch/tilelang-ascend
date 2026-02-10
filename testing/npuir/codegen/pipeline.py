@@ -3,7 +3,7 @@ import os
 import tilelang
 import tilelang.language as T
 
-from utils import assert_compile_to_kernel_o_success
+from utils import assert_compile_to_kernel_o_success, get_lowered_tvm_ir
 
 def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
     @T.prim_func
@@ -22,7 +22,7 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
             # T.use_swizzle(panel_size=10, enable=True)
 
             # Clear local accumulation
-            T.clear(C_local)
+            T.npuir_clear(C_local)
 
             for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
                 # Copy tile of A
@@ -52,6 +52,19 @@ block_M = 128
 block_N = 128
 block_K = 32
 
+def test_pipelined_num_stages_tvm_ir():
+    """校验 num_stages=3 时 TVM IR 中 shared buffer 为 3 份、索引为模 3。不调用 bishengir。"""
+    os.environ["TILELANG_ASCEND_MODE"] = "Developer"
+    func = matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float32")
+    tvm_ir_str = get_lowered_tvm_ir(func, target="npuir")
+    assert "(3, 128, 32)" in tvm_ir_str, f"expected (3, 128, 32) in TVM IR, got snippet: {tvm_ir_str[:1500]}"
+    assert "(3, 32, 128)" in tvm_ir_str, f"expected (3, 32, 128) in TVM IR, got snippet: {tvm_ir_str[:1500]}"
+    assert "% 3" in tvm_ir_str, (
+        f"expected mod 3 index in TVM IR, got snippet: {tvm_ir_str[:1500]}"
+    )
+    print(tvm_ir_str)
+
+
 def test_flash_attention_compile():
     os.environ["TILELANG_ASCEND_MODE"] = "Developer"
     """pytest 用例：flash attn 仅编译出 kernel.o，不依赖 torch_npu。"""
@@ -61,4 +74,5 @@ def test_flash_attention_compile():
 
 
 if __name__ == "__main__":
-    test_flash_attention_compile()
+    test_pipelined_num_stages_tvm_ir()
+    # test_flash_attention_compile()

@@ -10,10 +10,14 @@ from pathlib import Path
 import shutil
 from typing import Optional, Tuple
 
+import tvm
 from tvm import tir
 from tvm.tir import PrimFunc
+from tvm import IRModule
 
 from tilelang.engine import lower
+from tilelang.utils.target import determine_target
+from tilelang.engine.phase import LowerAndLegalize, OptimizeForTarget
 
 
 def _transform_stmt(stmt, symbolic_var_names):
@@ -85,6 +89,22 @@ def _symbolic_var_promoter_pass(func: PrimFunc) -> Tuple[PrimFunc, dict]:
         span=func.span,
     )
     return new_primfunc, dynamic_symbolic_map
+
+
+def get_lowered_tvm_ir(func: PrimFunc, target: str = "npuir") -> str:
+    """
+    对 PrimFunc 做与 lower() 相同的两阶段（LowerAndLegalize + OptimizeForTarget），
+    返回优化后的 TVM IR 字符串。不执行 codegen，不调用 bishengir。
+
+    用于校验 pipeline num_stages 等语义是否正确反映在 TVM IR 中。
+    """
+    func, _ = _symbolic_var_promoter_pass(func)
+    name = func.attrs.get("global_symbol", "kernel")
+    mod = IRModule({name: func})
+    tgt = tvm.target.Target.canon_target(determine_target(target))
+    mod = LowerAndLegalize(mod, tgt)
+    mod = OptimizeForTarget(mod, tgt)
+    return str(mod)
 
 
 def _get_npucompiler_path() -> str:

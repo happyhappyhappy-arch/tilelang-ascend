@@ -56,7 +56,7 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
 
 M = 1024  # M = T.dynamic("m") if you want to use dynamic shape
 N = 1024
-K = 1024
+K = 960   # K=960 => ceildiv(K, block_K)=30, pipeline body = [2, 30)
 block_M = 128
 block_N = 128
 block_K = 32
