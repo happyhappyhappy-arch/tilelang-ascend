@@ -120,12 +120,13 @@ if [ -z "$BISHENGIR_PATH" ]; then
     echo "warring: no --bishengir-path set, bishengir path will be found in environment variable PATH"
     # build bishengir in 3rdparty
     echo "build bishengir in 3rdparty"
-    git submodule update --init --recursive 3rdparty/AscendNPU-IR
+    git submodule update --init 3rdparty/AscendNPU-IR
     pushd 3rdparty/AscendNPU-IR
+    git submodule update --init
     bash ./build-tools/apply_patches.sh
     rm -rf ./build
-    ./build-tools/build.sh -o ./build --build-torch-mlir --c-compiler=clang --cxx-compiler=clang++ \
-    --add-cmake-options="-DCMAKE_LINKER=lld -DLLVM_ENABLE_LLD=ON" --apply-patches --bishengir-publish=off
+    ./build-tools/build.sh -o ./build --c-compiler=clang --cxx-compiler=clang++ \
+    --add-cmake-options="-DCMAKE_LINKER=lld -DLLVM_ENABLE_LLD=ON" --bishengir-publish=off
     BISHENGIR_PATH="./3rdparty/AscendNPU-IR/build/install"
     popd
 fi
