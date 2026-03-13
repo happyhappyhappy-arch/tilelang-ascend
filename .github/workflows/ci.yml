@@ -31,6 +31,9 @@ jobs:
     - name: Fetch base branch
       run: git fetch origin npuir
 
+    - name: Fetch base branch
+      run: git fetch origin npuir
+
     - name: Run format check
       run: |
         source tilelang_ci/bin/activate
