@@ -6,17 +6,16 @@
  * \brief TileLangIR modular optimizer driver (mlir-opt style).
  *
  */
- #include "tilelangir/InitAllDialects.h"
- #include "tilelangir/InitAllPasses.h"
- 
- #include "bishengir/InitAllDialects.h"
- #include "bishengir/InitAllExtensions.h"
- #include "bishengir/InitAllPasses.h"
- #include "bishengir/Dialect/HFusion/Transforms/Passes.h"
+#include "tilelangir/InitAllDialects.h"
+#include "tilelangir/InitAllPasses.h"
+
+#include "bishengir/InitAllDialects.h"
+#include "bishengir/InitAllExtensions.h"
+#include "bishengir/InitAllPasses.h"
 
 #include "mlir/InitAllDialects.h"
-#include "mlir/InitAllPasses.h"
 #include "mlir/InitAllExtensions.h"
+#include "mlir/InitAllPasses.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 
 #include "llvm/Support/CommandLine.h"
@@ -32,8 +31,6 @@ static llvm::cl::opt<bool, true> DebugOpt(
 }  // namespace
 
 int main(int argc, char **argv) {
-  llvm::InitLLVM y(argc, argv);
-
   mlir::DialectRegistry registry;
 
   mlir::registerAllDialects(registry);
@@ -41,7 +38,6 @@ int main(int argc, char **argv) {
   ::tilelangir::registerAllDialects(registry);
 
   mlir::registerAllPasses();
-  mlir::hfusion::registerHFusionPasses();
   bishengir::registerAllPasses();
   ::tilelangir::registerAllPasses();
 
@@ -49,8 +45,6 @@ int main(int argc, char **argv) {
   bishengir::registerAllExtensions(registry);
   // TODO: Add TileLangIR extensions
 
-  return mlir::asMainReturnCode(
-      mlir::MlirOptMain(argc, argv, "TileLangIR modular optimizer Tool\n",
-                        registry));
+  return mlir::asMainReturnCode(mlir::MlirOptMain(
+      argc, argv, "TileLangIR modular optimizer Tool\n", registry));
 }
-
