@@ -1142,6 +1142,32 @@ class compiler_npu:
                 continue
         return default
 
+    def _extract_kernel_name(self, so_path: str) -> None:
+        """Extract kernel_name from the compiled .so by finding the
+        *_infer_task_type_function symbol via ``nm -D``."""
+        MIX_SUFFIX_REGEX = r"_(mix_aic|mix_aiv)$"
+        suffix = "_infer_task_type_function"
+        kernel_name = None
+        if os.path.exists(so_path):
+            try:
+                result = subprocess.run(
+                    ["nm", "-D", so_path], capture_output=True, text=True, timeout=2
+                )
+                if result.returncode == 0:
+                    for line in result.stdout.split("\n"):
+                        parts = line.strip().split()
+                        if len(parts) >= 3 and parts[2].endswith(suffix):
+                            kernel_name = parts[2][: -len(suffix)]
+                            break
+            except (subprocess.SubprocessError, FileNotFoundError, OSError, TimeoutError):
+                pass
+        if kernel_name is None:
+            kernel_name = re.search(
+                r"func\.func\s+@(\w+)", self.mlir_content
+            ).group(1)
+        self.metadata["kernel_name"] = kernel_name
+        self.metadata["name"] = re.sub(MIX_SUFFIX_REGEX, "", kernel_name)
+
     def compile(self, mod: PrimFunc, out_idx=None) -> JitKernel_NPU:
         self.original_mod = mod
         # extract_param_info
@@ -1161,7 +1187,7 @@ class compiler_npu:
         self.out_idx = out_idx
         self.metadata["out_idx"] = self.out_idx
 
-        mlir_path = lower(self.mod)
+        mlir_path = lower(self.mod, target="npuir")
         if mlir_path.endswith(".mlir"):
             self.mlir_content = self._read_mlir_file(mlir_path)
         else:
@@ -1304,33 +1330,11 @@ class compiler_npu:
     def _parse_npuir_metadata(self) -> None:
         """
         Parse NPU IR to extract metadata required for NPU compilation.
-        Extracts and updates the following fields in metadata:
-          - mix_mode
-          - kernel_name
-          - tensor_kinds (currently hardcoded)
-          - shared (currently hardcoded)
-          - name (combined kernel_name and mix_mode)
-
-        Additionally, removes the mix_mode attribute from the IR.
+        kernel_name is extracted later from the compiled .so (see _npuir_to_bin_enable_npu_compile).
         """
-        # --- Regular expressions and examples ---
-        # Example: func.func @gather_sorted_kernel(%arg0: ...) -> gather_sorted_kernel
-        KERNEL_NAME_REGEX = r"func\.func\s+@(\w+)"
-
-        # Example：hivm.module_core_type<MIX> -> MIX
         MIX_MODE_REGEX = r"#hivm\.module_core_type<([^>]+)>"
 
-        # Example: test_mix_aic -> test
-        MIX_SUFFIX_REGEX = r"_(mix_aic|mix_aiv)$"
-
-        # Note: Compiled Kernel requires to estimate size of shared memory to occupy
-        # Currently, NPU backend does not limit on shared memory
         self.metadata["shared"] = 1
-        # the mix mode is also encoded into metadata['name'] for runtime to distinguish
-        kernel_name = re.search(KERNEL_NAME_REGEX, self.mlir_content).group(1)
-        self.metadata["kernel_name"] = kernel_name
-        # matching the end of the _mix_aic or _mix_aiv
-        self.metadata["name"] = re.sub(MIX_SUFFIX_REGEX, "", kernel_name)
         self.metadata["tensor_kinds"] = []
         self.metadata["mix_mode"] = (
             re.search(MIX_MODE_REGEX, self.mlir_content).group(1).lower()
@@ -1357,14 +1361,17 @@ class compiler_npu:
             "f16",
         }
 
-        # Extract the function signature part (the content within the parentheses)
+        # Extract the function signature part (the content within the parentheses).
+        # When outline_scope / emit_host_callbacks produce multiple func.func
+        # definitions, pick the one with the longest parameter list (the main
+        # kernel entry, not a callback or outlined scope).
         pattern = r"func\.func\s*@[^(]*\(([^)]*)\)"
-        match = re.search(pattern, self.mlir_content)
+        matches = re.findall(pattern, self.mlir_content)
 
-        if not match:
+        if not matches:
             return {}
 
-        params_str = match.group(1)
+        params_str = max(matches, key=len)
 
         # Segmentation parameters
         params = []
@@ -1437,19 +1444,24 @@ class compiler_npu:
             npu_compiler_path = get_npucompiler_path()
             # TileLang Ascend JIT Runtime now follows Triton JIT style.
             # bishengir-compile --enable-triton-kernel-compile=true make sure the way.
-            _compile_option_list = [
-                "--enable-auto-multi-buffer=true",
-                "--enable-triton-kernel-compile=true",
-                "--enable-hivm-compile=true",
-            ]
-
             TILELANG_ASCEND_MODE = os.environ.get("TILELANG_ASCEND_MODE")
-            if TILELANG_ASCEND_MODE is None or TILELANG_ASCEND_MODE.lower().strip() in [
-                "expert",
-                "exp",
-                "e",
-            ]:
-                _compile_option_list.append("--disable-hivm-tensor-compile=true")
+            _ascend_mode = (TILELANG_ASCEND_MODE or "").lower().strip()
+
+            if _ascend_mode == "mix":
+                _compile_option_list = [
+                    "--enable-auto-multi-buffer=false",
+                    "--enable-triton-kernel-compile=true",
+                    "--enable-hivm-compile=true",
+                    "--disable-hivm-tensor-compile=true",
+                ]
+            else:
+                _compile_option_list = [
+                    "--enable-auto-multi-buffer=true",
+                    "--enable-triton-kernel-compile=true",
+                    "--enable-hivm-compile=true",
+                ]
+                if _ascend_mode in ("", "expert", "exp", "e"):
+                    _compile_option_list.append("--disable-hivm-tensor-compile=true")
 
             cmd_list = (
                 [npu_compiler_path, ttadapter_path]
@@ -1477,6 +1489,8 @@ class compiler_npu:
                 so_path, "_infer_workspace_shape_function"
             )
             self.workspace_size = result
+
+            self._extract_kernel_name(so_path)
 
             if not Path(bin_path).exists():
                 err_lines = [

@@ -11,6 +11,7 @@
  
  #include "bishengir/InitAllDialects.h"
  #include "bishengir/InitAllExtensions.h"
+ #include "bishengir/InitAllPasses.h"
  #include "bishengir/Dialect/HFusion/Transforms/Passes.h"
 
 #include "mlir/InitAllDialects.h"
@@ -41,6 +42,7 @@ int main(int argc, char **argv) {
 
   mlir::registerAllPasses();
   mlir::hfusion::registerHFusionPasses();
+  bishengir::registerAllPasses();
   ::tilelangir::registerAllPasses();
 
   mlir::registerAllExtensions(registry);

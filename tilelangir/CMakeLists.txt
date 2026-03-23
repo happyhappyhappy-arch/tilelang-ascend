@@ -23,6 +23,11 @@ elseif(BISHENGIR_ROOT_PATH)
 endif()
 set(TILELANGIR_SYSTEM_LIBS z zstd dl m rt)
 
+# Derive include dirs from BISHENGIR_ROOT_PATH
+if(BISHENGIR_ROOT_PATH AND NOT BISHENGIR_INCLUDE_DIRS)
+  get_filename_component(BISHENGIR_INCLUDE_DIRS "${BISHENGIR_ROOT_PATH}/include" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
+endif()
+
 # Add subdirectories
 add_subdirectory(include)
 add_subdirectory(lib)

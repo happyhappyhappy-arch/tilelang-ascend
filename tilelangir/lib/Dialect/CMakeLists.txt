@@ -1,0 +1,12 @@
+add_library(tilelangir_dialect STATIC TileLangIR.cpp)
+set_target_properties(tilelangir_dialect PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_options(tilelangir_dialect PRIVATE -frtti)
+add_dependencies(tilelangir_dialect
+  tilelangir_dialect_decls_incgen
+  tilelangir_dialect_defs_incgen
+  tilelangir_op_decls_incgen
+  tilelangir_op_defs_incgen
+  tilelangir_enum_decls_incgen
+  tilelangir_enum_defs_incgen
+)
+target_link_libraries(tilelangir_dialect PUBLIC tilelangir_headers)

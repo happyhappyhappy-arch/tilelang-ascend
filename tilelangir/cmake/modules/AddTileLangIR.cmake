@@ -8,13 +8,20 @@ function(_tilelangir_tablegen_one td_rel tblgen_exe root_abs tblgen_args tblgen_
   else()
     set(td_abs "${CMAKE_CURRENT_SOURCE_DIR}/${td_rel}")
   endif()
-  string(REGEX REPLACE "\\.td$" ".h.inc" out_rel "${td_rel}")
+  if("${tblgen_args}" MATCHES "-gen-.*-defs")
+    string(REGEX REPLACE "\\.td$" ".cpp.inc" out_rel "${td_rel}")
+  else()
+    string(REGEX REPLACE "\\.td$" ".h.inc" out_rel "${td_rel}")
+  endif()
   set(out_path "${CMAKE_CURRENT_BINARY_DIR}/${out_rel}")
   get_filename_component(out_dir "${out_path}" DIRECTORY)
   file(MAKE_DIRECTORY "${out_dir}")
+  get_filename_component(td_dir "${td_abs}" DIRECTORY)
   add_custom_command(
     OUTPUT "${out_path}"
-    COMMAND ${tblgen_exe} ${tblgen_args} -I "${root_abs}/include"
+    COMMAND ${tblgen_exe} ${tblgen_args}
+            -I "${root_abs}/include"
+            -I "${td_dir}"
             "${td_abs}" -o "${out_path}"
     DEPENDS "${td_abs}"
     COMMENT "Building ${out_rel}..."

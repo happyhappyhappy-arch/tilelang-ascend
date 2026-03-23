@@ -278,9 +278,19 @@ def lower(
         if dump_ir:
             print("====== npuir ======")
             print(mlir_str)
+        ascend_mode = (os.environ.get('TILELANG_ASCEND_MODE') or '').lower().strip()
         pipeline = Pipeline()
         pipeline.add(transforms.mlir.canonicalize, top_down=True)
         pipeline.add(transforms.bishengir.adapt_triton_kernel)
+        if ascend_mode == 'mix':
+            pipeline.add(transforms.tilelangir.cv_annotate)
+            pipeline.add(transforms.tilelangir.insert_vid)
+            pipeline.add(transforms.tilelangir.analyze_cross_scope)
+            pipeline.add(transforms.tilelangir.simple_multibuffer)
+            pipeline.add(transforms.tilelangir.materialize_workspace)
+            pipeline.add(transforms.tilelangir.inject_block_sync)
+            pipeline.add(transforms.tilelangir.outline_scope)
+            pipeline.add(transforms.tilelangir.emit_host_callbacks)
         if dump_ir:
             pipeline.enable_ir_printing()
         mlir_str = pipeline.run(mlir_str)
