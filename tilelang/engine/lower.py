@@ -168,11 +168,8 @@ def device_codegen(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
     if target.kind.name == "npuir":
         # device_mod = tvm._ffi.get_global_func("target.build.tilelang_npuir")(device_mod, target)
         TILELANG_ASCEND_MODE = os.environ.get("TILELANG_ASCEND_MODE")
-        if TILELANG_ASCEND_MODE is None or TILELANG_ASCEND_MODE.lower().strip() in [
-            "expert",
-            "exp",
-            "e",
-        ]:
+        mode = (TILELANG_ASCEND_MODE or '').lower().strip()
+        if mode in ('', 'expert', 'exp', 'e', 'mix'):
             device_mod = tvm._ffi.get_global_func("target.build.tilelang_npuir_apis")(
                 device_mod, target
             )
