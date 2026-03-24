@@ -39,14 +39,11 @@ def minicv(M, N, K, block_M, block_N, block_K):
                 B_BUF = T.alloc_shared((block_M//2, block_K), dtype)
                 B_L1 = T.alloc_shared((block_M, block_K), dtype)
                 C_BUF = T.alloc_shared((block_K, block_N), dtype)
-                workspace = T.alloc_workspace((block_M, block_K), dtype)
                 T.copy(A[bx + (vid * block_M // 2), k * block_K], A_BUF, size=[block_M//2, block_K])
                 T.copy(C[k * block_K, by], C_BUF, size=[block_K, block_N])
 
                 T.vexp(A_BUF, B_BUF)
-                T.copy(B_BUF, workspace[vid * block_M // 2, 0], size=[block_M//2, block_K])
-                
-                T.copy(workspace, B_L1)
+                T.copy(B_BUF, B_L1[vid * block_M // 2, 0], size=[block_M//2, block_K])
 
                 T.gemm(B_L1, C_BUF, D_BUF, [block_M, block_K, block_N], initC = (k==0))
                 
