@@ -8,7 +8,7 @@ import tilelang.language as T
 seq_len = 512
 dim = 128
 
-torch.npu.set_device(0)
+# torch.npu.set_device(0)
 
 @tilelang.jit(out_idx=[-1], target="npuir")
 def online_flash_attention(block_M, block_N, block_K, dtype="float16", accum_dtype="float32"):
@@ -41,6 +41,7 @@ def online_flash_attention(block_M, block_N, block_K, dtype="float16", accum_dty
             acc_m = T.alloc_fragment([block_m, 1], accum_dtype)
             acc_l = T.alloc_fragment([block_m, 1], accum_dtype)
             acc_o = T.alloc_fragment([block_m, dim], accum_dtype)
+            acc_new = T.alloc_fragment([block_m, dim], accum_dtype)
             tmp = T.alloc_fragment([block_m, block_n], accum_dtype)
             tmp1 = T.alloc_fragment([block_m,1], accum_dtype)
             new_max = T.alloc_fragment([block_m,1], accum_dtype)
@@ -80,7 +81,9 @@ def online_flash_attention(block_M, block_N, block_K, dtype="float16", accum_dty
 
                 # cube
                 T.copy(V[k * block_n : (k + 1) * block_n, 0 : dim], V_shared)
-                T.gemm(scores_cast, V_shared, acc_o, initC=False)
+                T.gemm(scores_cast, V_shared, acc_new, initC=True)
+
+                T.vadd(acc_new, acc_o, acc_o)
 
             T.vdiv(acc_o, acc_l, acc_o)
             O_cast = T.alloc_shared([block_m, dim], dtype)
@@ -93,7 +96,7 @@ def online_flash_attention(block_M, block_N, block_K, dtype="float16", accum_dty
 def main():
     # In the futrue, Developer mode and Expert Mode will transition smoothly without
     # requiring explicit declarations.
-    os.environ['TILELANG_ASCEND_MODE'] = 'Developer'
+    # os.environ['TILELANG_ASCEND_MODE'] = 'Developer'
     kernel = online_flash_attention(64, 64, 32)
 
     q = torch.randn((seq_len, dim), dtype=torch.float16).npu()
